@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 #© @thealphabotz
 import asyncio
 import logging
@@ -5,17 +6,28 @@ import os
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-API_ID = 28462418
-API_HASH = "dac7a169fd7ba76bbd19e7fba96629db"
-SESSION_STRING = ""
+# Get environment variables with fallbacks to original values
+API_ID = int(os.environ.get('API_ID', '28462418'))
+API_HASH = os.environ.get('API_HASH', 'dac7a169fd7ba76bbd19e7fba96629db')
+SESSION_STRING = os.environ.get('SESSION_STRING', '')
 
 # Can be channel IDs or group IDs
-SOURCE_ENTITY = -1002668250369
-DESTINATION_ENTITY = -1002558951301
-START_POST_ID = 2
+SOURCE_ENTITY = int(os.environ.get('SOURCE_ENTITY', '-1002668250369'))
+DESTINATION_ENTITY = int(os.environ.get('DESTINATION_ENTITY', '-1002558951301'))
+START_POST_ID = int(os.environ.get('START_POST_ID', '2'))
 
+# Log the configuration (but not sensitive values)
+logger.info(f"Starting bot with SOURCE_ENTITY: {SOURCE_ENTITY}, DESTINATION_ENTITY: {DESTINATION_ENTITY}")
+logger.info(f"Starting from message ID: {START_POST_ID}")
+
+# Initialize client
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 async def get_entity(entity_id):
@@ -101,4 +113,8 @@ async def start_forwarding():
     await forward_batch(START_POST_ID)
 
 if __name__ == "__main__":
-    client.loop.run_until_complete(start_forwarding())
+    try:
+        logger.info("Starting Telegram forwarding bot")
+        client.loop.run_until_complete(start_forwarding())
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
