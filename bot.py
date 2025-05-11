@@ -22,6 +22,7 @@ SESSION_STRING = os.environ.get('SESSION_STRING', '')
 SOURCE_ENTITY = int(os.environ.get('SOURCE_ENTITY', '-1002668250369'))
 DESTINATION_ENTITY = int(os.environ.get('DESTINATION_ENTITY', '-1002558951301'))
 START_POST_ID = int(os.environ.get('START_POST_ID', '2'))
+MAX_GAP = int(os.environ.get('MAX_GAP', '20'))  # Max consecutive missing messages before considering end of history
 
 # Log the configuration (but not sensitive values)
 logger.info(f"Starting bot with SOURCE_ENTITY: {SOURCE_ENTITY}, DESTINATION_ENTITY: {DESTINATION_ENTITY}")
@@ -63,14 +64,22 @@ async def forward_batch(start_id, batch_size=1000, delay=5, pause_hours=3):
         
         message_id = start_id
         batch_count = 0
+        missing_count = 0  # Counter for consecutive missing messages
         
-        # First check if message exists
-        message = await client.get_messages(source_entity, ids=message_id)
-        if not message:
-            logging.info(f"No messages found starting at ID {message_id}")
+        # First check if we can find at least one message
+        found_any = False
+        for offset in range(0, 100):
+            try_id = start_id + offset
+            message = await client.get_messages(source_entity, ids=try_id)
+            if message:
+                found_any = True
+                message_id = try_id  # Start from this message
+                logging.info(f"Found message at ID {try_id}, starting from there")
+                break
+        
+        if not found_any:
+            logging.info(f"No messages found in range {start_id} to {start_id+100}")
             logging.info("Bot will now watch for new messages...")
-            
-            # Instead of returning, keep the bot running to watch for new messages
             await watch_for_new_messages(source_entity, destination_entity, delay)
             return
             
@@ -79,11 +88,21 @@ async def forward_batch(start_id, batch_size=1000, delay=5, pause_hours=3):
             for msg_id in range(message_id, end_id):
                 try:
                     message = await client.get_messages(source_entity, ids=msg_id)
+                    
                     if not message:
-                        logging.info(f"No more messages found at ID {msg_id}")
-                        # Instead of returning, keep the bot running to watch for new messages
-                        await watch_for_new_messages(source_entity, destination_entity, delay)
-                        return
+                        logging.info(f"No message found at ID {msg_id}")
+                        missing_count += 1
+                        
+                        # If we've seen too many consecutive missing messages, assume we've reached the end
+                        if missing_count >= MAX_GAP:
+                            logging.info(f"Reached {MAX_GAP} consecutive missing messages, assuming end of history")
+                            # Switch to watching for new messages
+                            await watch_for_new_messages(source_entity, destination_entity, delay)
+                            return
+                        continue  # Skip to next message ID
+                    
+                    # Reset missing count since we found a message
+                    missing_count = 0
                     
                     if message.media:
                         file_path = await client.download_media(message.media)
@@ -185,14 +204,92 @@ async def watch_for_new_messages(source_entity, destination_entity, delay=5):
             logging.error(f"Error watching for new messages: {e}")
             await asyncio.sleep(delay)
 
-async def start_forwarding():
-    await forward_batch(START_POST_ID)
+# New function to handle backfill and watch mode
+async def smart_forward():
+    async with client:
+        source_entity = await get_entity(SOURCE_ENTITY)
+        destination_entity = await get_entity(DESTINATION_ENTITY)
+
+        # Get most recent message ID to know the upper bound
+        most_recent_id = None
+        try:
+            messages = await client.get_messages(source_entity, limit=1)
+            if messages and len(messages) > 0:
+                most_recent_id = messages[0].id
+                logging.info(f"Most recent message ID: {most_recent_id}")
+        except Exception as e:
+            logging.error(f"Error getting most recent message: {e}")
+        
+        # Start with historical backfill
+        current_id = START_POST_ID
+        consecutive_missing = 0
+        max_consecutive_missing = MAX_GAP
+        
+        while most_recent_id is None or current_id <= most_recent_id:
+            try:
+                message = await client.get_messages(source_entity, ids=current_id)
+                
+                if message:
+                    # Reset missing counter when we find a message
+                    consecutive_missing = 0
+                    
+                    # Forward the message
+                    if message.media:
+                        file_path = await client.download_media(message.media)
+                        if file_path:
+                            await client.send_file(
+                                destination_entity,
+                                file_path,
+                                caption=message.text or "",
+                                force_document=False
+                            )
+                            logging.info(f"Forwarded message ID: {current_id}")
+                            # Clean up
+                            try:
+                                os.remove(file_path)
+                            except:
+                                pass
+                        else:
+                            logging.error(f"Failed to download media for message ID {current_id}")
+                    elif message.text:
+                        await client.send_message(destination_entity, message.text)
+                        logging.info(f"Forwarded message ID: {current_id}")
+                    
+                    await asyncio.sleep(5)  # Delay between forwards
+                else:
+                    # Message not found
+                    consecutive_missing += 1
+                    logging.info(f"No message found at ID {current_id} (missing: {consecutive_missing}/{max_consecutive_missing})")
+                    
+                    # If too many consecutive messages are missing, do a jump ahead
+                    if consecutive_missing >= max_consecutive_missing:
+                        jump_size = 500  # Jump ahead
+                        logging.info(f"Too many missing messages, jumping ahead {jump_size} IDs...")
+                        current_id += jump_size
+                        consecutive_missing = 0
+                        continue
+                
+                current_id += 1  # Move to next message ID
+                
+                # Check if we've reached the most recent message
+                if most_recent_id and current_id > most_recent_id:
+                    logging.info(f"Reached most recent message ID {most_recent_id}, switching to watch mode")
+                    break
+                
+            except Exception as e:
+                logging.error(f"Error processing message ID {current_id}: {e}")
+                await asyncio.sleep(5)
+                current_id += 1
+        
+        # After historical backfill, switch to watching mode
+        await watch_for_new_messages(source_entity, destination_entity)
 
 if __name__ == "__main__":
     try:
         logger.info("Starting Telegram forwarding bot")
-        client.loop.run_until_complete(start_forwarding())
-        # Keep the bot running after forward_batch completes
+        # Use the new smart_forward function instead
+        client.loop.run_until_complete(smart_forward())
+        # Keep the bot running
         client.loop.run_until_complete(client.run_until_disconnected())
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
