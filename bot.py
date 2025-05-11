@@ -64,6 +64,16 @@ async def forward_batch(start_id, batch_size=1000, delay=5, pause_hours=3):
         message_id = start_id
         batch_count = 0
         
+        # First check if message exists
+        message = await client.get_messages(source_entity, ids=message_id)
+        if not message:
+            logging.info(f"No messages found starting at ID {message_id}")
+            logging.info("Bot will now watch for new messages...")
+            
+            # Instead of returning, keep the bot running to watch for new messages
+            await watch_for_new_messages(source_entity, destination_entity, delay)
+            return
+            
         while True:
             end_id = message_id + batch_size
             for msg_id in range(message_id, end_id):
@@ -71,6 +81,8 @@ async def forward_batch(start_id, batch_size=1000, delay=5, pause_hours=3):
                     message = await client.get_messages(source_entity, ids=msg_id)
                     if not message:
                         logging.info(f"No more messages found at ID {msg_id}")
+                        # Instead of returning, keep the bot running to watch for new messages
+                        await watch_for_new_messages(source_entity, destination_entity, delay)
                         return
                     
                     if message.media:
@@ -109,6 +121,70 @@ async def forward_batch(start_id, batch_size=1000, delay=5, pause_hours=3):
             logging.info(f"Pausing for {pause_hours} hours...")
             await asyncio.sleep(pause_hours * 3600)
 
+# New function to watch for new messages
+async def watch_for_new_messages(source_entity, destination_entity, delay=5):
+    """
+    Watch for new messages in the source entity and forward them to the destination
+    """
+    logging.info("Started watching for new messages...")
+    
+    # Keep track of the last message ID we've seen
+    last_id = 0
+    
+    try:
+        # Get the most recent message to establish a starting point
+        messages = await client.get_messages(source_entity, limit=1)
+        if messages and len(messages) > 0:
+            last_id = messages[0].id
+            logging.info(f"Watching for messages newer than ID: {last_id}")
+    except Exception as e:
+        logging.error(f"Error getting most recent message: {e}")
+        last_id = 0
+    
+    # Keep the bot running indefinitely
+    while True:
+        try:
+            # Check for new messages
+            messages = await client.get_messages(source_entity, limit=10, offset_id=last_id)
+            
+            # Process new messages in chronological order
+            for message in reversed(messages):
+                if message.id > last_id:
+                    logging.info(f"New message detected with ID: {message.id}")
+                    
+                    # Forward the message
+                    if message.media:
+                        file_path = await client.download_media(message.media)
+                        if file_path:
+                            await client.send_file(
+                                destination_entity,
+                                file_path,
+                                caption=message.text or "",
+                                force_document=False
+                            )
+                            logging.info(f"Forwarded new media message: {message.id}")
+                            # Clean up
+                            try:
+                                os.remove(file_path)
+                            except:
+                                pass
+                        else:
+                            logging.error(f"Failed to download media for message ID {message.id}")
+                    elif message.text:
+                        await client.send_message(destination_entity, message.text)
+                        logging.info(f"Forwarded new text message: {message.id}")
+                    
+                    # Update last seen ID
+                    if message.id > last_id:
+                        last_id = message.id
+            
+            # Wait before checking again
+            await asyncio.sleep(delay)
+            
+        except Exception as e:
+            logging.error(f"Error watching for new messages: {e}")
+            await asyncio.sleep(delay)
+
 async def start_forwarding():
     await forward_batch(START_POST_ID)
 
@@ -116,5 +192,7 @@ if __name__ == "__main__":
     try:
         logger.info("Starting Telegram forwarding bot")
         client.loop.run_until_complete(start_forwarding())
+        # Keep the bot running after forward_batch completes
+        client.loop.run_until_complete(client.run_until_disconnected())
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
